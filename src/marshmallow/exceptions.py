@@ -56,6 +56,41 @@ class ValidationError(MarshmallowError):
         return self.messages
 
 
+class SerdesPolicyError(MarshmallowError):
+    """Base class for errors raised by the runtime (de)serialization policy stack."""
+
+
+class SerdesAdmissionError(SerdesPolicyError):
+    """Raised when a runtime policy frame rejects a new ``load``/``loads``/
+    ``dump``/``dumps`` call.
+
+    The rejection never cancels or rewrites a conversion that has already entered
+    field processing: the gate is only checked when a new conversion is admitted.
+
+    :param operation: The public entry point that was rejected (``"load"``,
+        ``"loads"``, ``"dump"`` or ``"dumps"``).
+    :param gate: The ``serdes_admit`` value that caused the rejection
+        (``"deny_new"`` or ``"one_more"``).
+    """
+
+    def __init__(self, *, operation: str, gate: str):
+        self.operation = operation
+        self.gate = gate
+        super().__init__(
+            f"{operation}() rejected by the serdes policy stack "
+            f"(serdes_admit={gate!r})."
+        )
+
+
+class FrozenErrorStoreError(SerdesPolicyError, TypeError):
+    """Raised when collected validation error messages are mutated while a
+    ``freeze_errors`` policy frame is active.
+
+    Subclasses :exc:`TypeError` so frozen error containers behave like other
+    immutable built-in containers, while remaining a :class:`MarshmallowError`.
+    """
+
+
 class RegistryError(NameError):
     """Raised when an invalid operation is performed on the serializer
     class registry.

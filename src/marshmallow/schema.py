@@ -18,7 +18,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from itertools import zip_longest
 
-from marshmallow import class_registry, types
+from marshmallow import class_registry, runtime, types
 from marshmallow import fields as ma_fields
 from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
@@ -29,7 +29,7 @@ from marshmallow.decorators import (
     VALIDATES,
     VALIDATES_SCHEMA,
 )
-from marshmallow.error_store import ErrorStore
+from marshmallow.error_store import ErrorStore, freeze_containers
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
@@ -545,7 +545,13 @@ class Schema(metaclass=SchemaMeta):
             ret[key] = value
         return ret
 
-    def dump(self, obj: typing.Any, *, many: bool | None = None):
+    def dump(
+        self,
+        obj: typing.Any,
+        *,
+        many: bool | None = None,
+        _serdes_admitted: str | None = None,
+    ):
         """Serialize an object to native Python data types according to this
         Schema's fields.
 
@@ -561,6 +567,11 @@ class Schema(metaclass=SchemaMeta):
         .. versionchanged:: 3.0.0rc9
             Validation no longer occurs upon serialization.
         """
+        # ``_serdes_admitted`` is set by ``dumps`` so the JSON entry point is
+        # admitted exactly once. Nested schemas call ``dump`` without it and
+        # pass the runtime policy gate as new conversions.
+        if _serdes_admitted is None:
+            runtime.admit_serdes("dump")
         many = self.many if many is None else bool(many)
         if self._hooks[PRE_DUMP]:
             processed_obj = self._invoke_dump_processors(
@@ -591,7 +602,8 @@ class Schema(metaclass=SchemaMeta):
             A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is raised
             if ``obj`` is invalid.
         """
-        serialized = self.dump(obj, many=many)
+        runtime.admit_serdes("dumps")
+        serialized = self.dump(obj, many=many, _serdes_admitted="dumps")
         return self.opts.render_module.dumps(serialized, *args, **kwargs)
 
     def _deserialize(
@@ -711,6 +723,7 @@ class Schema(metaclass=SchemaMeta):
         many: bool | None = None,
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
+        _serdes_admitted: str | None = None,
     ):
         """Deserialize a data structure to an object defined by this Schema's fields.
 
@@ -731,6 +744,11 @@ class Schema(metaclass=SchemaMeta):
             A :exc:`ValidationError <marshmallow.exceptions.ValidationError>` is raised
             if invalid data are passed.
         """
+        # ``_serdes_admitted`` is set by ``loads`` so the JSON entry point is
+        # admitted exactly once. Nested schemas call ``load`` without it and
+        # pass the runtime policy gate as new conversions.
+        if _serdes_admitted is None:
+            runtime.admit_serdes("load")
         return self._do_load(
             data, many=many, partial=partial, unknown=unknown, postprocess=True
         )
@@ -767,8 +785,15 @@ class Schema(metaclass=SchemaMeta):
         .. versionchanged:: 4.0.0
             Rename ``json_module`` parameter to ``s``.
         """
+        runtime.admit_serdes("loads")
         data = self.opts.render_module.loads(s, **kwargs)
-        return self.load(data, many=many, partial=partial, unknown=unknown)
+        return self.load(
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            _serdes_admitted="loads",
+        )
 
     def _run_validator(
         self,
@@ -867,7 +892,12 @@ class Schema(metaclass=SchemaMeta):
         error_store = ErrorStore()
         errors: dict[str, list[str]] = {}
         many = self.many if many is None else bool(many)
-        unknown = self.unknown if unknown is None else unknown
+        # Merge Meta/call-argument unknown with the runtime policy stack. The
+        # frame is read for this conversion; nested schemas read it again on
+        # their own ``load`` entry.
+        unknown = runtime.effective_unknown(
+            self.unknown if unknown is None else unknown
+        )
         if partial is None:
             partial = self.partial
         # Run preprocessors
@@ -895,12 +925,14 @@ class Schema(metaclass=SchemaMeta):
                 partial=partial,
                 unknown=unknown,
             )
-            # Run field-level validation
-            self._invoke_field_validators(
-                error_store=error_store, data=result, many=many
-            )
+            # Run field-level validation, unless the current frame skips
+            # validators. The frame is read again for schema-level validators.
+            if not runtime.validators_skipped():
+                self._invoke_field_validators(
+                    error_store=error_store, data=result, many=many
+                )
             # Run schema-level validation
-            if self._hooks[VALIDATES_SCHEMA]:
+            if not runtime.validators_skipped() and self._hooks[VALIDATES_SCHEMA]:
                 field_errors = bool(error_store.errors)
                 self._invoke_schema_validators(
                     error_store=error_store,
@@ -937,6 +969,12 @@ class Schema(metaclass=SchemaMeta):
                 except ValidationError as err:
                     errors = err.normalized_messages()
         if errors:
+            # Under freeze_errors, hand out immutable error containers: errors
+            # collected through the ErrorStore are already frozen; this also
+            # covers errors raised by pre/post-load processors. The failure is
+            # still raised normally, never swallowed or rewritten to success.
+            if runtime.errors_frozen():
+                errors = freeze_containers(errors)
             exc = ValidationError(errors, data=data, valid_data=result)
             self.handle_error(exc, data, many=many, partial=partial)
             raise exc
